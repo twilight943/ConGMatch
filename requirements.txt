@@ -1,0 +1,6 @@
+networkx==3.3
+numpy==1.26.4
+scikit-learn==1.6.1
+scipy==1.15.2
+torch==2.2.1+cu121
+torch-geometric==2.6.1

@@ -1,92 +1,123 @@
 import time
 
-import numpy as np
 import torch
-from sklearn.metrics import accuracy_score, average_precision_score, confusion_matrix, precision_score, recall_score, roc_auc_score
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 
-from candidate_invariance import build_candidate_batch_from_pyg_pairs
-
-
-def get_candidate_graph_cache(args):
-    if not getattr(args, "candidate_graph_cache", False):
-        return None
-    cache = getattr(args, "_candidate_graph_cache", None)
-    if cache is None:
-        cache = {}
-        setattr(args, "_candidate_graph_cache", cache)
-    return cache
+from candidate_graph import build_candidate_batch
 
 
-def candidate_prediction_signal(logits, args):
-    if getattr(args, "candidate_loss", "mse") == "mse":
-        return torch.sigmoid(logits)
-    return logits
+def _synchronize(device):
+    device = torch.device(device)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 
-def evaluator(pred, raw_pred, labels):
-    auroc = roc_auc_score(labels, raw_pred)
+def evaluate_metrics(predictions, scores, labels):
+    auroc = roc_auc_score(labels, scores)
+    metric_scores = scores
     if auroc < 0.5:
-        raw_pred = -raw_pred
-        auroc = roc_auc_score(labels, raw_pred)
-    tn, fp, fn, tp = confusion_matrix(labels, pred, labels=[0, 1], normalize="all").ravel()
+        metric_scores = -scores
+        auroc = roc_auc_score(labels, metric_scores)
+    tn, fp, fn, tp = confusion_matrix(labels, predictions, normalize="all").ravel()
     return {
-        "auroc": auroc,
-        "acc": accuracy_score(labels, pred),
-        "prec": precision_score(labels, pred, zero_division=0),
-        "recall": recall_score(labels, pred, zero_division=0),
-        "avg_prec": average_precision_score(labels, raw_pred),
-        "tn": tn,
-        "fp": fp,
-        "fn": fn,
-        "tp": tp,
+        "auroc": float(auroc),
+        "acc": float(accuracy_score(labels, predictions)),
+        "prec": float(precision_score(labels, predictions, zero_division=0)),
+        "recall": float(recall_score(labels, predictions, zero_division=0)),
+        "f1": float(f1_score(labels, predictions, zero_division=0)),
+        "avg_prec": float(average_precision_score(labels, metric_scores)),
+        "tn": float(tn),
+        "fp": float(fp),
+        "fn": float(fn),
+        "tp": float(tp),
     }
 
 
+def _cache(args):
+    if not args.candidate_graph_cache:
+        return None
+    if not hasattr(args, "_candidate_graph_cache"):
+        args._candidate_graph_cache = {}
+    return args._candidate_graph_cache
+
+
 @torch.no_grad()
-def get_preds(model, dataset, device, args):
-    preds = []
-    raw_preds = []
-    all_labels = []
-    runtime = 0.0
-    eval_batch_size = args.candidate_eval_batch_size if args.candidate_eval_batch_size > 0 else args.batch_size
-    batches = dataset.iter_batches(eval_batch_size) if hasattr(dataset, "iter_batches") else (
-        dataset.get_batch(eval_batch_size) for _ in range(args.eval_batches)
-    )
-    for _, g1, g2, g3 in batches:
-        batch_size = len(g1)
-        labels = torch.tensor(([1] * batch_size + [0] * batch_size), dtype=torch.long, device=device)
-        start_time = time.time()
-        candidate_batch = build_candidate_batch_from_pyg_pairs(
-            g2 + g3,
-            g1 + g1,
-            mode="association",
+def evaluate(model, dataset, device, args):
+    model.eval()
+    scores = []
+    predictions = []
+    labels = []
+    build_time = 0.0
+    forward_time = 0.0
+    pair_count = 0.0
+    edge_count = 0.0
+    sample_count = 0
+    positive_empty = 0
+    negative_empty = 0
+    batch_size = args.candidate_eval_batch_size or args.batch_size
+    if hasattr(dataset, "iter_batches"):
+        batches = dataset.iter_batches(batch_size)
+    else:
+        batches = (dataset.get_batch(batch_size) for _ in range(args.eval_batches))
+    for _, targets, positives, negatives in batches:
+        batch_labels = torch.tensor(
+            [1] * len(positives) + [0] * len(negatives), device=device
+        )
+        _synchronize(device)
+        start = time.perf_counter()
+        candidate_batch = build_candidate_batch(
+            positives + negatives,
+            targets + targets,
+            device,
             maxloop=args.candidate_maxloop,
-            device=device,
             max_pairs=args.association_max_pairs,
             max_edges=args.association_max_edges,
-            cache=get_candidate_graph_cache(args),
+            cache=_cache(args),
             cache_max_entries=args.candidate_graph_cache_max_entries,
         )
-        logits = model.candidate_logits(candidate_batch).view(-1)
-        raw_pred = candidate_prediction_signal(logits, args).view(-1)
-        pred = model.predictor(raw_pred.unsqueeze(-1)).argmax(dim=-1)
-        runtime += time.time() - start_time
-        preds.append(pred.view(-1))
-        raw_preds.append(raw_pred.view(-1))
-        all_labels.append(labels.view(-1))
-    pred = torch.cat(preds, dim=-1).detach().cpu().numpy()
-    raw_pred = torch.cat(raw_preds, dim=-1).detach().cpu().numpy()
-    labels = torch.cat(all_labels, dim=-1).detach().cpu().numpy()
-    return evaluator(pred, raw_pred, labels), runtime
-
-
-@torch.no_grad()
-def validation(model, valset, device, args):
-    model.eval()
-    return get_preds(model, valset, device, args)
-
-
-@torch.no_grad()
-def test(model, testset, device, args):
-    model.eval()
-    return get_preds(model, testset, device, args)
+        _synchronize(device)
+        build_time += time.perf_counter() - start
+        empty = candidate_batch.has_empty_candidate_set.bool().view(-1)
+        positive_empty += int(empty[: len(positives)].sum().item())
+        negative_empty += int(empty[len(positives) :].sum().item())
+        pair_count += float(candidate_batch.association_pair_count.sum().item())
+        edge_count += float(candidate_batch.association_edge_count.sum().item())
+        sample_count += int(batch_labels.numel())
+        _synchronize(device)
+        start = time.perf_counter()
+        batch_scores = torch.sigmoid(model.candidate_logits(candidate_batch)).view(-1)
+        batch_predictions = (batch_scores >= args.prediction_threshold).long()
+        _synchronize(device)
+        forward_time += time.perf_counter() - start
+        scores.append(batch_scores.cpu())
+        predictions.append(batch_predictions.cpu())
+        labels.append(batch_labels.cpu())
+    scores = torch.cat(scores).numpy()
+    predictions = torch.cat(predictions).numpy()
+    labels = torch.cat(labels).numpy()
+    result = evaluate_metrics(predictions, scores, labels)
+    denominator = max(sample_count, 1)
+    positive_count = max(int((labels == 1).sum()), 1)
+    negative_count = max(int((labels == 0).sum()), 1)
+    result.update(
+        {
+            "candidate_build_time": build_time,
+            "model_forward_time": forward_time,
+            "runtime": build_time + forward_time,
+            "runtime_avg": (build_time + forward_time) / denominator,
+            "association_pairs_avg": pair_count / denominator,
+            "association_edges_avg": edge_count / denominator,
+            "positive_empty_rate": positive_empty / positive_count,
+            "negative_empty_rate": negative_empty / negative_count,
+            "num_eval_samples": sample_count,
+        }
+    )
+    return result

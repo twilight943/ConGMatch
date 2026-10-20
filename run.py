@@ -1,408 +1,302 @@
 import argparse
-import copy
-import os
+import json
 import random
+import re
 import time
+from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-import yaml
-from torch.nn import CrossEntropyLoss
 
-try:
-    from torch.utils.tensorboard import SummaryWriter
-except ImportError:
-    class SummaryWriter:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def add_scalar(self, *args, **kwargs):
-            pass
-
-        def close(self):
-            pass
-
-from dataset import GRFTripletDataset, SCDataset, build_grf_label_to_index, load_tu_dataset
-from inference import test, validation
-from models import NC
-from candidate_invariance import build_candidate_batch_from_pyg_pairs
+from candidate_graph import build_candidate_batch
+from dataset import load_datasets
+from inference import evaluate
+from model import CongMatch
 
 
-torch.set_printoptions(precision=4)
-device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
-RESULT_KEYS = ["auroc", "acc", "prec", "recall", "avg_prec", "tn", "fp", "fn", "tp"]
+RESULT_KEYS = (
+    "auroc",
+    "acc",
+    "prec",
+    "recall",
+    "f1",
+    "avg_prec",
+    "tn",
+    "fp",
+    "fn",
+    "tp",
+)
 
 
 def str2bool(value):
     if isinstance(value, bool):
         return value
-    return value.lower() in {"true", "1", "yes", "y"}
+    value = value.lower()
+    if value in {"true", "1", "yes", "y"}:
+        return True
+    if value in {"false", "0", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError("expected a boolean value")
 
 
-def set_seeds_all(seed):
+def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = True
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = True
 
 
-def log_builder(args):
-    current_time = time.strftime("%Y-%m-%dT%H-%M", time.localtime())
-    dataset_label = os.path.basename(os.path.normpath(args.dataset_name)) or "dataset"
-    logd = os.path.join(f"exp_{args.task}", f"{args.name}_transformer_mask_{dataset_label}_{current_time}")
-    os.makedirs(logd, exist_ok=True)
-    logger = SummaryWriter(log_dir=logd)
-    config = {key: value for key, value in vars(args).items() if not key.startswith("_")}
-    config["path"] = logd
-    with open(os.path.join(logd, "config.yaml"), "w") as file:
-        file.write(yaml.dump(config))
-    return logger, logd
-
-
-def log_train(logger, loss, acc, num_batches):
-    logger.add_scalar("loss/train", loss.item(), num_batches)
-    logger.add_scalar("acc/train", acc.item(), num_batches)
-
-
-def result_to_vector(result):
-    return [result[key] for key in RESULT_KEYS]
-
-
-def summarize_result_vectors(vectors, prefix):
-    values = np.array(vectors, dtype=float)
-    means = np.mean(values, axis=0)
-    stds = np.sqrt(np.var(values, axis=0))
-    summary = {}
-    for idx, key in enumerate(RESULT_KEYS):
-        summary[f"{prefix}_{key}_mean"] = means[idx]
-        summary[f"{prefix}_{key}_std"] = stds[idx]
-    return summary
-
-
-def log_test_result(logger, args, result, runtime):
-    logger.add_scalar(f"{args.task}_runtime/test", runtime)
-    for key, value in result.items():
-        logger.add_scalar(f"{args.task}_{key}/test", value)
-
-
-def split_train_test_pairs(raw_dataset, graph_dataset, train_ratio=0.8, seed=0):
-    if not 0.0 < train_ratio < 1.0:
-        raise ValueError(f"train_ratio must be in (0, 1), got {train_ratio}")
-    n = len(raw_dataset)
-    if n != len(graph_dataset):
-        raise ValueError(f"raw_dataset and graph_dataset must have the same length, got {n} and {len(graph_dataset)}")
-    if n < 2:
-        raise ValueError(f"Need at least 2 samples to split train/test, got {n}")
-    indices = list(range(n))
-    rng = random.Random(seed)
-    rng.shuffle(indices)
-    train_size = int(n * train_ratio)
-    train_size = max(1, min(train_size, n - 1))
-    train_indices = indices[:train_size]
-    test_indices = indices[train_size:]
-    raw_train = [raw_dataset[i] for i in train_indices]
-    graph_train = [graph_dataset[i] for i in train_indices]
-    raw_test = [raw_dataset[i] for i in test_indices]
-    graph_test = [graph_dataset[i] for i in test_indices]
-    return raw_train, graph_train, raw_test, graph_test
-
-
-def split_dataset_object(dataset, valid_ratio=0.2, seed=0):
-    if not 0.0 < valid_ratio < 1.0:
-        raise ValueError(f"valid_ratio must be in (0, 1), got {valid_ratio}")
-    n = len(dataset)
-    if n < 2:
-        raise ValueError(f"Need at least 2 samples to split train/valid, got {n}")
-    indices = list(range(n))
-    rng = random.Random(seed)
-    rng.shuffle(indices)
-    valid_size = int(n * valid_ratio)
-    valid_size = max(1, min(valid_size, n - 1))
-    valid_indices = indices[:valid_size]
-    train_indices = indices[valid_size:]
-
-    def build_subset(selected_indices):
-        subset = copy.copy(dataset)
-        for attr_name, value in vars(dataset).items():
-            if isinstance(value, list) and len(value) == n:
-                setattr(subset, attr_name, [value[i] for i in selected_indices])
-            elif isinstance(value, tuple) and len(value) == n:
-                setattr(subset, attr_name, tuple(value[i] for i in selected_indices))
-            elif isinstance(value, np.ndarray) and len(value) == n:
-                setattr(subset, attr_name, value[selected_indices])
-        return subset
-
-    return build_subset(train_indices), build_subset(valid_indices)
-
-
-def resolve_run_seeds(args):
-    if args.seeds:
-        seeds = [int(seed.strip()) for seed in args.seeds.split(",") if seed.strip()]
-        if not seeds:
-            raise ValueError("--seeds was provided but no valid integer seeds were found.")
-        args.runs = len(seeds)
-        return seeds
-    return [args.seed + run for run in range(args.runs)]
-
-
-def resolve_grf_root(dataset_name):
-    candidates = [dataset_name, os.path.join("dataset", dataset_name)]
-    for candidate in candidates:
-        if os.path.isdir(os.path.join(candidate, "queries")) and os.path.isdir(os.path.join(candidate, "targets")):
-            return candidate
-    return None
-
-
-def load_standard_datasets(args, seed):
-    grf_root = resolve_grf_root(args.dataset_name)
-    if grf_root is not None:
-        perm_root = os.path.join(grf_root, "perm")
-        label_roots = [grf_root]
-        if os.path.isdir(perm_root):
-            label_roots.append(perm_root)
-        label_to_index = build_grf_label_to_index(label_roots)
-        full_trainset = GRFTripletDataset(
-            grf_root,
-            label_to_index=label_to_index,
-            cache=args.grf_cache,
-            preload=args.grf_preload,
-        )
-        trainset, validset = split_dataset_object(full_trainset, valid_ratio=args.grf_valid_ratio, seed=seed)
-        evalset = (
-            GRFTripletDataset(
-                perm_root,
-                label_to_index=label_to_index,
-                cache=args.grf_cache,
-                preload=args.grf_preload,
-            )
-            if os.path.isdir(perm_root)
-            else validset
-        )
-        return trainset, validset, evalset
-    num_node_labels, (graphs_all, _, _), (raw_all, _, _) = load_tu_dataset(args.dataset_name)
-    args.input_dim = 1 if num_node_labels == 0 else num_node_labels
-    raw_train, graphs_train, raw_test, graphs_test = split_train_test_pairs(
-        raw_all,
-        graphs_all,
-        train_ratio=args.train_ratio,
-        seed=seed,
-    )
-    trainset = SCDataset(raw_train, graphs_train, args.dataset_name)
-    validset = SCDataset(raw_test, graphs_test, args.dataset_name)
-    return trainset, validset, validset
-
-
-def get_candidate_graph_cache(args):
+def candidate_cache(args):
     if not args.candidate_graph_cache:
         return None
-    cache = getattr(args, "_candidate_graph_cache", None)
-    if cache is None:
-        cache = {}
-        setattr(args, "_candidate_graph_cache", cache)
-    return cache
+    if not hasattr(args, "_candidate_graph_cache"):
+        args._candidate_graph_cache = {}
+    return args._candidate_graph_cache
 
 
-def candidate_training_signal(logits, args):
-    if args.candidate_loss == "mse":
-        return torch.sigmoid(logits)
-    return logits
+def positive_mean(values, labels):
+    positive = labels.view(-1) > 0.5
+    if not positive.any():
+        return values.new_zeros(())
+    return values.view(-1)[positive].mean()
 
 
-def candidate_objective(logits, labels, batch_size, args):
-    labels = labels.float()
-    if args.candidate_loss == "mse":
-        return F.mse_loss(torch.sigmoid(logits), labels)
-    if args.candidate_loss == "bce":
-        return F.binary_cross_entropy_with_logits(logits, labels)
-    if args.candidate_loss == "bce_pairwise":
-        bce = F.binary_cross_entropy_with_logits(logits, labels)
-        pos_logits = logits[:batch_size]
-        neg_logits = logits[batch_size:batch_size + pos_logits.size(0)]
-        pairwise = F.softplus(neg_logits - pos_logits + args.candidate_pairwise_margin).mean()
-        return bce + args.candidate_pairwise_weight * pairwise
-    raise ValueError("candidate_loss must be one of: mse, bce, bce_pairwise.")
-
-
-def train(model, optimizer, pred_optimizer, dataset, logger, epoch, args):
+def train_epoch(model, optimizer, dataset, device, args, epoch):
     model.train()
-    total_loss = 0.0
-    labels = torch.tensor(([1] * args.batch_size + [0] * args.batch_size), dtype=torch.long, device=device)
+    loss_sum = 0.0
+    correct = 0
+    example_count = 0
     runtime = 0.0
-    criterion = CrossEntropyLoss()
-    for i in range(args.iterations):
-        optimizer.zero_grad(set_to_none=True)
-        pred_optimizer.zero_grad(set_to_none=True)
-        _, g1, g2, g3 = dataset.get_batch(args.batch_size)
-        start_time = time.time()
-        candidate_batch = build_candidate_batch_from_pyg_pairs(
-            g2 + g3,
-            g1 + g1,
-            mode="association",
+    for iteration in range(args.iterations):
+        start = time.perf_counter()
+        _, targets, positives, negatives = dataset.get_batch(args.batch_size)
+        queries = positives + negatives
+        paired_targets = targets + targets
+        labels = torch.tensor(
+            [1.0] * len(positives) + [0.0] * len(negatives), device=device
+        )
+        candidate_batch = build_candidate_batch(
+            queries,
+            paired_targets,
+            device,
             maxloop=args.candidate_maxloop,
-            device=device,
             max_pairs=args.association_max_pairs,
             max_edges=args.association_max_edges,
-            cache=get_candidate_graph_cache(args),
+            cache=candidate_cache(args),
             cache_max_entries=args.candidate_graph_cache_max_entries,
         )
+        optimizer.zero_grad(set_to_none=True)
         logits = model.candidate_logits(candidate_batch).view(-1)
-        loss = candidate_objective(logits, labels, args.batch_size, args)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.candidate_model.parameters(), 1.0)
-        optimizer.step()
-        raw_pred = candidate_training_signal(logits.detach(), args).view(-1)
-        pred = model.predictor(raw_pred.unsqueeze(-1))
-        pred_loss = criterion(pred, labels)
-        pred_loss.backward()
-        pred_optimizer.step()
-        acc = torch.mean((pred.argmax(dim=-1) == labels).float())
-        step = i + args.iterations * epoch
-        log_train(logger, loss, acc, step)
-        runtime += time.time() - start_time
-        print(
-            "Iteration: {:02d}. time: {:.4f}. loss: {:.4f}. Acc: {:.4f}.".format(
-                step,
-                time.time() - start_time,
-                loss.item(),
-                acc.item(),
-            ),
-            end="                    \r",
+        constraints = model.candidate_constraint_losses()
+        loss = F.binary_cross_entropy_with_logits(logits, labels)
+        loss = loss + args.camh_lambda_cover * positive_mean(
+            constraints["cover"], labels
         )
-        total_loss += loss.detach()
-    return total_loss / args.iterations, runtime
+        loss = loss + args.camh_lambda_inj * positive_mean(
+            constraints["inj"], labels
+        )
+        loss = loss + args.camh_lambda_edge * positive_mean(
+            constraints["edge"], labels
+        )
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        with torch.no_grad():
+            predictions = (torch.sigmoid(logits) >= args.prediction_threshold).long()
+            correct += int((predictions == labels.long()).sum().item())
+            example_count += labels.numel()
+        elapsed = time.perf_counter() - start
+        runtime += elapsed
+        loss_sum += float(loss.item())
+        global_step = epoch * args.iterations + iteration
+        print(
+            f"epoch={epoch + 1} step={global_step + 1} "
+            f"loss={loss.item():.6f} acc={correct / example_count:.4f} "
+            f"time={elapsed:.4f}s",
+            end="\r",
+        )
+    print()
+    return loss_sum / args.iterations, correct / max(example_count, 1), runtime
+
+
+def safe_name(value):
+    parts = [part for part in Path(value).parts[-2:] if part not in {".", "..", "\\"}]
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", "_".join(parts)).strip("_") or "dataset"
+
+
+def make_output_directory(args, run_index, seed):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    name = f"congmatch_{safe_name(args.dataset_name)}_{timestamp}_run{run_index:02d}_seed{seed}"
+    path = Path(args.output_dir) / name
+    path.mkdir(parents=True, exist_ok=False)
+    config = {key: value for key, value in vars(args).items() if not key.startswith("_")}
+    (path / "config.json").write_text(
+        json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return path
+
+
+def run_once(args, run_index, seed, device):
+    set_seed(seed)
+    if hasattr(args, "_candidate_graph_cache"):
+        args._candidate_graph_cache.clear()
+    output_directory = make_output_directory(args, run_index, seed)
+    train_set, validation_set, test_set = load_datasets(args, seed)
+    model = CongMatch(args).to(device)
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+    )
+    best_accuracy = float("-inf")
+    best_epoch = -1
+    best_state = None
+    best_train_accuracy = 0.0
+    stale_evaluations = 0
+    total_runtime = 0.0
+    for epoch in range(args.epochs):
+        loss, train_accuracy, runtime = train_epoch(
+            model, optimizer, train_set, device, args, epoch
+        )
+        total_runtime += runtime
+        should_evaluate = (
+            (epoch + 1) >= args.eval_interval
+            and (epoch + 1) % args.eval_steps == 0
+        )
+        if should_evaluate:
+            validation = evaluate(model, validation_set, device, args)
+            total_runtime += validation["runtime"]
+            print(
+                f"epoch={epoch + 1} loss={loss:.6f} train_acc={train_accuracy:.4f} "
+                f"val_acc={validation['acc']:.4f} val_auroc={validation['auroc']:.4f}"
+            )
+            if validation["acc"] > best_accuracy:
+                best_accuracy = validation["acc"]
+                best_epoch = epoch + 1
+                best_train_accuracy = train_accuracy
+                stale_evaluations = 0
+                best_state = {
+                    key: value.detach().cpu().clone()
+                    for key, value in model.state_dict().items()
+                }
+                if args.save_model:
+                    torch.save(best_state, output_directory / "best.pt")
+            else:
+                stale_evaluations += 1
+        if args.patience > 0 and stale_evaluations >= args.patience:
+            break
+        if args.max_runtime_hours > 0 and total_runtime >= args.max_runtime_hours * 3600:
+            break
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    validation = evaluate(model, validation_set, device, args)
+    test = evaluate(model, test_set, device, args)
+    result = {
+        "seed": seed,
+        "best_epoch": best_epoch,
+        "selected_train_acc": best_train_accuracy,
+        "validation": validation,
+        "test": test,
+        "training_validation_runtime": total_runtime,
+    }
+    (output_directory / "result.json").write_text(
+        json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    print(
+        f"run={run_index:02d} best_epoch={best_epoch} "
+        f"validation_acc={validation['acc']:.4f} test_acc={test['acc']:.4f} "
+        f"test_auroc={test['auroc']:.4f} output={output_directory}"
+    )
+    return result
 
 
 def run(args):
-    print(f"executing on {device}")
-    results_list = []
-    run_seeds = resolve_run_seeds(args)
-    for run_idx, seed in enumerate(run_seeds):
-        set_seeds_all(seed)
-        logger, logd = log_builder(args)
-        trainset, validset, evalset = load_standard_datasets(args, seed)
-        model = NC(args).to(device)
-        optimizer = torch.optim.Adam(model.candidate_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-        pred_optimizer = torch.optim.Adam(model.predictor.parameters(), lr=args.lr)
-        best_epoch = -1
-        best_auroc = float("-inf")
-        best_result = None
-        best_state_dict = None
-        bad_epoch = 0
-        total_runtime = 0.0
-        start_run = time.time()
-        for epoch in range(args.epochs):
-            loss, runtime = train(model, optimizer, pred_optimizer, trainset, logger, epoch, args)
-            total_runtime += runtime
-            logger.add_scalar("total_loss/train", loss.item(), epoch)
-            logger.add_scalar("runtime/train", runtime, epoch)
-            if (epoch + 1) % args.eval_steps == 0 and (epoch + 1) >= args.eval_interval:
-                result, runtime = validation(model, validset, device, args)
-                total_runtime += runtime
-                if result["auroc"] > best_auroc:
-                    best_auroc = result["auroc"]
-                    best_result = result
-                    best_epoch = epoch
-                    bad_epoch = 0
-                    best_state_dict = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
-                    if args.save_model:
-                        torch.save(model.state_dict(), os.path.join(logd, "best.pt"))
-                else:
-                    bad_epoch += 1
-                for key, value in result.items():
-                    logger.add_scalar(f"{args.task}_{key}/val", value, epoch)
-                logger.add_scalar(f"{args.task}_best_auroc/val", best_auroc, epoch)
-                logger.add_scalar(f"{args.task}_best_epoch/val", best_epoch, epoch)
-                logger.add_scalar(f"{args.task}_runtime/val", runtime, epoch)
-                print(
-                    "\nEpoch: {:02d}. Loss: {:.4f}. AUROC: {:.4f}. Best AUROC: {:.4f}. ACC: {:.4f}. Best epoch: {:02d}".format(
-                        epoch,
-                        loss.item(),
-                        result["auroc"],
-                        best_auroc,
-                        result["acc"],
-                        best_epoch,
-                    )
-                )
-            if bad_epoch >= args.patience:
-                break
-            if args.max_runtime_hours > 0 and total_runtime >= args.max_runtime_hours * 3600:
-                break
-        if best_state_dict is not None:
-            model.load_state_dict(best_state_dict)
-        result, runtime = test(model, evalset, device, args)
-        log_test_result(logger, args, result, runtime)
-        result_vector = result_to_vector(result)
-        results_list.append(result_vector)
-        with open(os.path.join(logd, "result"), "a") as file:
-            if best_result is not None:
-                for key, value in best_result.items():
-                    file.write(f"best_{key} {value}\n")
-            file.write(f"best_epoch {best_epoch}\n")
-            for key, value in result.items():
-                file.write(f"{key} {value}\n")
-            file.write(f"runtime {runtime}\n")
-        torch.save(result_vector, os.path.join(logd, "result.pt"))
-        print(
-            "\nRun: {:02d}. Runtime: {:.4f}. Best AUROC: {:.4f}. Test AUROC: {:.4f}. Test ACC: {:.4f}. Inference time: {:.4f}.".format(
-                run_idx,
-                time.time() - start_run,
-                best_auroc,
-                result["auroc"],
-                result["acc"],
-                runtime,
-            )
-        )
-        logger.close()
-    final_result = summarize_result_vectors(results_list, args.task)
-    print(final_result)
+    device = torch.device(args.device if args.device else ("cuda:0" if torch.cuda.is_available() else "cpu"))
+    seeds = (
+        [int(value.strip()) for value in args.seeds.split(",") if value.strip()]
+        if args.seeds
+        else [args.seed + index for index in range(args.runs)]
+    )
+    results = [run_once(args, index, seed, device) for index, seed in enumerate(seeds)]
+    test_vectors = np.array(
+        [[result["test"][key] for key in RESULT_KEYS] for result in results], dtype=float
+    )
+    summary = {
+        key: {
+            "mean": float(test_vectors[:, index].mean()),
+            "std": float(test_vectors[:, index].std()),
+        }
+        for index, key in enumerate(RESULT_KEYS)
+    }
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="LPIMatch")
-    parser.add_argument("--dataset_name", type=str, default="aids")
+    parser = argparse.ArgumentParser(description="CongMatch")
+    parser.add_argument("--dataset_name", default="cox2")
     parser.add_argument("--seed", type=int, default=4538)
-    parser.add_argument("--seeds", type=str, default=None)
+    parser.add_argument("--seeds")
     parser.add_argument("--runs", type=int, default=1)
+    parser.add_argument("--device")
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=500)
-    parser.add_argument("--patience", type=int, default=50)
+    parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--eval_steps", type=int, default=1)
     parser.add_argument("--eval_interval", type=int, default=10)
     parser.add_argument("--eval_batches", type=int, default=32)
+    parser.add_argument("--max_runtime_hours", type=float, default=0.0)
     parser.add_argument("--train_ratio", type=float, default=0.8)
     parser.add_argument("--grf_valid_ratio", type=float, default=0.2)
     parser.add_argument("--grf_cache", type=str2bool, default=True)
     parser.add_argument("--grf_preload", type=str2bool, default=False)
-    parser.add_argument("--save_model", type=str2bool, default=True)
-    parser.add_argument("--max_runtime_hours", type=float, default=0.0)
-    parser.add_argument("--task", type=str, default="main")
-    parser.add_argument("--name", type=str, default="lpimatch")
+    parser.add_argument("--lr", type=float, default=0.00017)
     parser.add_argument("--weight_decay", type=float, default=0.0)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--label_pi_mode", type=str, default="off", choices=["off"])
-    parser.add_argument("--candidate_pi_mode", type=str, default="association", choices=["association"])
-    parser.add_argument("--association_backend", type=str, default="transformer_mask", choices=["transformer_mask"])
-    parser.add_argument("--association_heads", type=int, default=4)
-    parser.add_argument("--association_pool", type=str, default="max", choices=["max", "mean", "sum", "max_mean"])
+    parser.add_argument("--candidate_hidden_dim", type=int, default=32)
+    parser.add_argument("--candidate_num_layers", type=int, default=2)
+    parser.add_argument("--candidate_dropout", type=float, default=0.0)
+    parser.add_argument("--association_heads", type=int, default=2)
+    parser.add_argument("--candidate_maxloop", type=int, default=2)
     parser.add_argument("--association_max_pairs", type=int, default=0)
     parser.add_argument("--association_max_edges", type=int, default=0)
-    parser.add_argument("--candidate_maxloop", type=int, default=10)
-    parser.add_argument("--candidate_hidden_dim", type=int, default=64)
-    parser.add_argument("--candidate_num_layers", type=int, default=3)
-    parser.add_argument("--candidate_dropout", type=float, default=0.0)
-    parser.add_argument("--candidate_loss", type=str, default="mse", choices=["mse", "bce", "bce_pairwise"])
-    parser.add_argument("--candidate_pairwise_weight", type=float, default=0.5)
-    parser.add_argument("--candidate_pairwise_margin", type=float, default=0.2)
-    parser.add_argument("--candidate_eval_batch_size", type=int, default=1)
+    parser.add_argument("--camh_gamma_c", type=float, default=0.984)
+    parser.add_argument("--camh_lambda_cover", type=float, default=0.999)
+    parser.add_argument("--camh_lambda_inj", type=float, default=0.975)
+    parser.add_argument("--camh_lambda_edge", type=float, default=0.571)
+    parser.add_argument("--candidate_eval_batch_size", type=int, default=0)
+    parser.add_argument("--prediction_threshold", type=float, default=0.5)
     parser.add_argument("--candidate_graph_cache", type=str2bool, default=True)
     parser.add_argument("--candidate_graph_cache_max_entries", type=int, default=0)
+    parser.add_argument("--output_dir", default="experiments")
+    parser.add_argument("--save_model", type=str2bool, default=True)
+    parser.add_argument(
+        "--candidate_pi_mode", default="association_fused", choices=["association_fused"]
+    )
+    parser.add_argument(
+        "--association_backend",
+        default="transformer_dual_relation",
+        choices=["transformer_dual_relation"],
+    )
+    parser.add_argument("--label_pi_mode", default="off", choices=["off"])
+    parser.add_argument("--candidate_loss", default="bce", choices=["bce"])
+    parser.add_argument("--camh_enable", type=str2bool, default=True)
+    parser.add_argument("--camh_loss_type", default="camh_new", choices=["camh_new"])
     return parser
 
 
+def validate_fixed_configuration(args):
+    if not args.camh_enable:
+        raise ValueError("This streamlined implementation only supports --camh_enable true")
+    if args.batch_size <= 0 or args.iterations <= 0 or args.epochs <= 0:
+        raise ValueError("batch_size, iterations and epochs must be positive")
+    if args.candidate_eval_batch_size < 0:
+        raise ValueError("candidate_eval_batch_size must be non-negative")
+
+
 if __name__ == "__main__":
-    run(build_parser().parse_args())
+    arguments = build_parser().parse_args()
+    validate_fixed_configuration(arguments)
+    run(arguments)
